@@ -17,14 +17,9 @@ work_dir: /tmp/work
 queue_dir: /tmp/queue
 log_file: /tmp/sync.log
 
-gitea_credentials:
-  - name: gitea-http
-    type: http
-    username: alice
-    password: secret123
-  - name: gitea-ssh
-    type: ssh
-    ssh_key: /home/alice/.ssh/gitea_key
+gitea:
+  username: alice
+  password: secret123
 
 github_credentials:
   - name: gh-main
@@ -34,7 +29,6 @@ projects:
   - name: project-a
     gitea_repo: https://gitea.example.com/alice/project-a.git
     github_repo: git@github.com:alice/project-a.git
-    gitea_credential: gitea-http
     github_credential: gh-main
     secret: proj-secret
 `
@@ -62,8 +56,11 @@ func TestLoad(t *testing.T) {
 	if cfg.Server.Secret != "global-secret" {
 		t.Errorf("secret: got %q", cfg.Server.Secret)
 	}
-	if len(cfg.GiteaCredentials) != 2 {
-		t.Errorf("gitea creds: got %d, want 2", len(cfg.GiteaCredentials))
+	if cfg.Gitea.Username != "alice" {
+		t.Errorf("gitea username: got %q, want 'alice'", cfg.Gitea.Username)
+	}
+	if cfg.Gitea.Password != "secret123" {
+		t.Errorf("gitea password: got %q, want 'secret123'", cfg.Gitea.Password)
 	}
 	if len(cfg.GithubCredentials) != 1 {
 		t.Errorf("github creds: got %d, want 1", len(cfg.GithubCredentials))
@@ -93,21 +90,35 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
-func TestFindGiteaCredential(t *testing.T) {
-	path := writeConfig(t, testYAML)
-	cfg, _ := config.Load(path)
-
-	cred, err := cfg.FindGiteaCredential("gitea-http")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestLoad_RejectsLegacyGiteaCredentials(t *testing.T) {
+	legacy := `
+gitea_credentials:
+  - name: gitea-http
+    type: http
+    username: alice
+    password: secret
+`
+	path := writeConfig(t, legacy)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for legacy gitea_credentials, got nil")
 	}
-	if cred.Username != "alice" {
-		t.Errorf("username: got %q, want 'alice'", cred.Username)
-	}
+}
 
-	_, err = cfg.FindGiteaCredential("nonexistent")
-	if err == nil {
-		t.Error("expected error for nonexistent credential")
+func TestLoad_RejectsLegacyProjectGiteaCredential(t *testing.T) {
+	legacy := `
+gitea:
+  username: alice
+  password: secret
+projects:
+  - name: project-a
+    gitea_repo: https://gitea.example.com/alice/project-a.git
+    github_repo: git@github.com:alice/project-a.git
+    gitea_credential: gitea-http
+    github_credential: gh-main
+`
+	path := writeConfig(t, legacy)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for legacy project.gitea_credential, got nil")
 	}
 }
 
