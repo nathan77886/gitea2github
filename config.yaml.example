@@ -1,0 +1,49 @@
+server:
+  port: 8080
+  # Global webhook secret (HMAC-SHA256). Can be overridden per-project.
+  secret: ""
+
+# Directory where local bare-clone mirrors are stored.
+work_dir: /data/work
+
+# Directory used for the async task queue.
+queue_dir: /data/queue
+
+# Path to the rolling sync log (max 100 entries).
+log_file: /data/sync.log
+
+# ─── Gitea credentials ────────────────────────────────────────────────────────
+# Each entry has a unique "name" referenced from projects.
+gitea_credentials:
+  - name: gitea-http-account1
+    type: http
+    username: my-gitea-user
+    password: my-gitea-password
+
+  - name: gitea-ssh-account1
+    type: ssh
+    ssh_key: /home/app/.ssh/gitea_id_ed25519
+
+# ─── GitHub credentials ───────────────────────────────────────────────────────
+github_credentials:
+  - name: github-ssh-account1
+    ssh_key: /home/app/.ssh/github_id_ed25519
+
+# ─── Projects ─────────────────────────────────────────────────────────────────
+# Each project maps a Gitea source repo to a GitHub target repo.
+# "gitea_repo" must match the clone URL that Gitea sends in the webhook payload.
+projects:
+  - name: my-project
+    gitea_repo: https://gitea.example.com/owner/my-project.git
+    github_repo: git@github.com:owner/my-project.git
+    gitea_credential: gitea-http-account1
+    github_credential: github-ssh-account1
+    # Per-project webhook secret (optional, overrides global secret).
+    secret: ""
+
+  - name: another-project
+    gitea_repo: git@gitea.example.com:owner/another-project.git
+    github_repo: git@github.com:owner/another-project.git
+    gitea_credential: gitea-ssh-account1
+    github_credential: github-ssh-account1
+    secret: ""
