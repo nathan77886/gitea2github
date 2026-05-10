@@ -2,9 +2,11 @@ package git
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/nathan77886/gitea2github/internal/config"
 )
@@ -15,12 +17,26 @@ type Syncer struct {
 	cfg     *config.Config
 }
 
-// New creates a Syncer that stores local bare repos under workDir.
+// New creates a Syncer that stores local repos under workDir.
 func New(workDir string, cfg *config.Config) *Syncer {
 	return &Syncer{workDir: workDir, cfg: cfg}
 }
 
-// Sync performs a fetch from Gitea and a mirror-push to GitHub for project p.
+// Sync mirrors branches from Gitea (origin) to GitHub (github) for project p
+// using a "rebase_then_force" strategy:
+//
+//   - Local repo is a normal (non-bare) clone created with --no-checkout.
+//   - origin points at Gitea, github points at GitHub.
+//   - Each run fetches both remotes with --prune.
+//   - For every Gitea branch (refs/remotes/origin/*, except HEAD):
+//   - if the branch does not yet exist on GitHub it is pushed as-is;
+//   - otherwise the Gitea branch is checked out, rebased onto
+//     refs/remotes/github/<branch> and force-pushed (with lease).
+//     A rebase conflict aborts the rebase and skips that branch (logged)
+//     rather than failing the entire sync.
+//
+// Branches that exist only on GitHub are intentionally left alone, and tags
+// are not synced – this is deliberately less aggressive than push --mirror.
 func (s *Syncer) Sync(p *config.Project) error {
 	giteaCred, err := s.cfg.FindGiteaCredential(p.GiteaCredential)
 	if err != nil {
@@ -31,7 +47,10 @@ func (s *Syncer) Sync(p *config.Project) error {
 		return err
 	}
 
-	repoDir := filepath.Join(s.workDir, p.Name+".git")
+	// New layout: non-bare clone at <workDir>/<name>. Old "<name>.git"
+	// mirror directories from previous versions are no longer used; on
+	// upgrade a fresh clone will be created here.
+	repoDir := filepath.Join(s.workDir, p.Name)
 
 	// Build the effective Gitea URL (embed HTTP credentials when needed).
 	giteaURL, err := buildGiteaURL(p.GiteaRepo, giteaCred)
@@ -39,35 +58,114 @@ func (s *Syncer) Sync(p *config.Project) error {
 		return fmt.Errorf("building gitea URL: %w", err)
 	}
 
-	// SSH environment for Gitea (used when type == ssh).
 	giteaEnv := buildSSHEnv(giteaCred.SSHKey)
-
-	// SSH environment for GitHub.
 	githubEnv := buildSSHEnv(githubCred.SSHKey)
 
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
-		// First time: bare-clone from Gitea.
-		if err := s.runGit(giteaEnv, "clone", "--mirror", giteaURL, repoDir); err != nil {
+		// First time: regular clone without checking out a working tree.
+		if err := s.runGit(giteaEnv, "clone", "--no-checkout", "--origin", "origin", giteaURL, repoDir); err != nil {
 			return fmt.Errorf("cloning %s: %w", p.GiteaRepo, err)
-		}
-	} else {
-		// Subsequent: fetch all updates from Gitea.
-		if err := s.runGitInDir(repoDir, giteaEnv, "fetch", "--all", "--prune"); err != nil {
-			return fmt.Errorf("fetching %s: %w", p.GiteaRepo, err)
 		}
 	}
 
-	// Ensure the github remote exists.
+	// Ensure both remotes exist with up-to-date URLs.
+	if err := s.ensureRemote(repoDir, "origin", giteaURL, giteaEnv); err != nil {
+		return fmt.Errorf("setting origin remote: %w", err)
+	}
 	if err := s.ensureRemote(repoDir, "github", p.GithubRepo, githubEnv); err != nil {
 		return fmt.Errorf("setting github remote: %w", err)
 	}
 
-	// Mirror-push to GitHub.
-	if err := s.runGitInDir(repoDir, githubEnv, "push", "github", "--mirror"); err != nil {
-		return fmt.Errorf("pushing to GitHub: %w", err)
+	// Fetch both sides.
+	if err := s.runGitInDir(repoDir, giteaEnv, "fetch", "origin", "--prune"); err != nil {
+		return fmt.Errorf("fetching origin: %w", err)
+	}
+	if err := s.runGitInDir(repoDir, githubEnv, "fetch", "github", "--prune"); err != nil {
+		return fmt.Errorf("fetching github: %w", err)
+	}
+
+	// Enumerate Gitea branches.
+	branches, err := s.listRemoteBranches(repoDir, "origin")
+	if err != nil {
+		return fmt.Errorf("listing origin branches: %w", err)
+	}
+	githubBranches, err := s.listRemoteBranches(repoDir, "github")
+	if err != nil {
+		return fmt.Errorf("listing github branches: %w", err)
+	}
+	githubHas := make(map[string]bool, len(githubBranches))
+	for _, b := range githubBranches {
+		githubHas[b] = true
+	}
+
+	for _, branch := range branches {
+		if err := s.syncBranch(repoDir, branch, githubHas[branch], githubEnv); err != nil {
+			// Per-branch errors are logged; we keep going so a single
+			// problematic branch doesn't block the rest.
+			log.Printf("sync project %s branch %s: %v", p.Name, branch, err)
+		}
 	}
 
 	return nil
+}
+
+// syncBranch handles one branch using the rebase_then_force strategy.
+func (s *Syncer) syncBranch(repoDir, branch string, existsOnGithub bool, githubEnv []string) error {
+	originRef := "refs/remotes/origin/" + branch
+	githubRef := "refs/remotes/github/" + branch
+
+	if !existsOnGithub {
+		// Fresh branch on GitHub – plain push, no force needed.
+		return s.runGitInDir(repoDir, githubEnv, "push", "github",
+			originRef+":refs/heads/"+branch)
+	}
+
+	// Branch exists on both sides: rebase Gitea tip onto GitHub tip,
+	// then force-push (with lease). We need a working tree for rebase,
+	// so check out a throwaway local branch at the Gitea tip.
+	tmpBranch := "sync/" + branch
+	if err := s.runGitInDir(repoDir, nil, "checkout", "-B", tmpBranch, originRef); err != nil {
+		return fmt.Errorf("checking out %s: %w", originRef, err)
+	}
+
+	if err := s.runGitInDir(repoDir, nil, "rebase", githubRef); err != nil {
+		// Abort the in-progress rebase so the repo is left clean for
+		// the next branch / next sync.
+		_ = s.runGitInDir(repoDir, nil, "rebase", "--abort")
+		return fmt.Errorf("rebase onto %s failed, skipping: %w", githubRef, err)
+	}
+
+	// --force-with-lease guards against overwriting GitHub commits we
+	// haven't seen since the last fetch.
+	leaseArg := "--force-with-lease=refs/heads/" + branch + ":" + githubRef
+	return s.runGitInDir(repoDir, githubEnv, "push", leaseArg, "github",
+		"HEAD:refs/heads/"+branch)
+}
+
+// listRemoteBranches returns the short branch names under refs/remotes/<remote>/,
+// excluding the symbolic HEAD entry.
+func (s *Syncer) listRemoteBranches(repoDir, remote string) ([]string, error) {
+	cmd := exec.Command("git", "for-each-ref",
+		"--format=%(refname)", "refs/remotes/"+remote+"/")
+	cmd.Dir = repoDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git for-each-ref: %w\n%s", err, out)
+	}
+	prefix := "refs/remotes/" + remote + "/"
+	var branches []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name := strings.TrimPrefix(line, prefix)
+		if name == "HEAD" {
+			continue
+		}
+		branches = append(branches, name)
+	}
+	return branches, nil
 }
 
 // buildGiteaURL returns a URL suitable for use as a git remote.
