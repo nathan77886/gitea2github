@@ -3,6 +3,7 @@ package git
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,10 +39,6 @@ func New(workDir string, cfg *config.Config) *Syncer {
 // Branches that exist only on GitHub are intentionally left alone, and tags
 // are not synced – this is deliberately less aggressive than push --mirror.
 func (s *Syncer) Sync(p *config.Project) error {
-	giteaCred, err := s.cfg.FindGiteaCredential(p.GiteaCredential)
-	if err != nil {
-		return err
-	}
 	githubCred, err := s.cfg.FindGithubCredential(p.GithubCredential)
 	if err != nil {
 		return err
@@ -53,12 +50,13 @@ func (s *Syncer) Sync(p *config.Project) error {
 	repoDir := filepath.Join(s.workDir, p.Name)
 
 	// Build the effective Gitea URL (embed HTTP credentials when needed).
-	giteaURL, err := buildGiteaURL(p.GiteaRepo, giteaCred)
+	giteaURL, err := buildGiteaURL(p.GiteaRepo, s.cfg.Gitea)
 	if err != nil {
 		return fmt.Errorf("building gitea URL: %w", err)
 	}
 
-	giteaEnv := buildSSHEnv(giteaCred.SSHKey)
+	// Gitea is HTTP/HTTPS only – no SSH env needed.
+	var giteaEnv []string
 	githubEnv := buildSSHEnv(githubCred.SSHKey)
 
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
@@ -169,25 +167,22 @@ func (s *Syncer) listRemoteBranches(repoDir, remote string) ([]string, error) {
 }
 
 // buildGiteaURL returns a URL suitable for use as a git remote.
-// For HTTP credentials the username:password is embedded; for SSH the URL is
-// returned unchanged (authentication is handled via GIT_SSH_COMMAND).
-func buildGiteaURL(rawURL string, cred *config.GiteaCredential) (string, error) {
-	if cred.Type == "ssh" {
-		return rawURL, nil
+// Gitea is only supported over HTTP/HTTPS; when a username is configured the
+// credentials are embedded into the URL using net/url so that special
+// characters (@, :, #, ?, …) in tokens or passwords are properly escaped.
+func buildGiteaURL(rawURL string, gitea config.GiteaConfig) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing gitea_repo %q: %w", rawURL, err)
 	}
-	// HTTP – embed credentials.
-	if cred.Username == "" {
-		return rawURL, nil
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("gitea_repo %q must use http or https (Gitea SSH is not supported)", rawURL)
 	}
-	// Inject user:pass into the URL.
-	// e.g. https://gitea.example.com/owner/repo
-	//   -> https://user:pass@gitea.example.com/owner/repo
-	for _, scheme := range []string{"https://", "http://"} {
-		if len(rawURL) > len(scheme) && rawURL[:len(scheme)] == scheme {
-			return scheme + cred.Username + ":" + cred.Password + "@" + rawURL[len(scheme):], nil
-		}
+	if gitea.Username == "" {
+		return u.String(), nil
 	}
-	return rawURL, nil
+	u.User = url.UserPassword(gitea.Username, gitea.Password)
+	return u.String(), nil
 }
 
 // buildSSHEnv returns the environment additions needed to use a specific SSH key.

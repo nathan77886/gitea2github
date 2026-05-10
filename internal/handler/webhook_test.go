@@ -24,7 +24,6 @@ func buildConfig() *config.Config {
 				Name:             "my-project",
 				GiteaRepo:        "https://gitea.example.com/owner/my-project.git",
 				GithubRepo:       "git@github.com:owner/my-project.git",
-				GiteaCredential:  "gitea-http",
 				GithubCredential: "github-ssh",
 				Secret:           "test-secret",
 			},

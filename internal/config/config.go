@@ -7,13 +7,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// GiteaCredential holds authentication info for a Gitea instance.
-type GiteaCredential struct {
-	Name     string `yaml:"name"`
-	Type     string `yaml:"type"` // http or ssh
+// GiteaConfig holds the global HTTP credentials used for every Gitea repo.
+// Gitea is only supported over HTTP/HTTPS; the username/password (or token)
+// are embedded into the clone URL at sync time.
+type GiteaConfig struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
-	SSHKey   string `yaml:"ssh_key"`
 }
 
 // GithubCredential holds authentication info for a GitHub account.
@@ -27,7 +26,6 @@ type Project struct {
 	Name             string `yaml:"name"`
 	GiteaRepo        string `yaml:"gitea_repo"`
 	GithubRepo       string `yaml:"github_repo"`
-	GiteaCredential  string `yaml:"gitea_credential"`
 	GithubCredential string `yaml:"github_credential"`
 	Secret           string `yaml:"secret"` // per-project webhook secret (optional)
 }
@@ -44,9 +42,20 @@ type Config struct {
 	WorkDir           string             `yaml:"work_dir"`
 	QueueDir          string             `yaml:"queue_dir"`
 	LogFile           string             `yaml:"log_file"`
-	GiteaCredentials  []GiteaCredential  `yaml:"gitea_credentials"`
+	Gitea             GiteaConfig        `yaml:"gitea"`
 	GithubCredentials []GithubCredential `yaml:"github_credentials"`
 	Projects          []Project          `yaml:"projects"`
+}
+
+// legacyConfig is used to detect old configuration files that still contain
+// the removed gitea_credentials / project.gitea_credential fields, so we can
+// fail fast with a clear migration message instead of silently ignoring them.
+type legacyConfig struct {
+	GiteaCredentials []map[string]any `yaml:"gitea_credentials"`
+	Projects         []struct {
+		Name            string `yaml:"name"`
+		GiteaCredential string `yaml:"gitea_credential"`
+	} `yaml:"projects"`
 }
 
 // Load reads and parses the YAML config file at path.
@@ -55,6 +64,21 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
+
+	var legacy legacyConfig
+	if err := yaml.Unmarshal(data, &legacy); err == nil {
+		if len(legacy.GiteaCredentials) > 0 {
+			return nil, fmt.Errorf("config: 'gitea_credentials' is no longer supported; " +
+				"replace it with a single global 'gitea: {username, password}' block")
+		}
+		for _, p := range legacy.Projects {
+			if p.GiteaCredential != "" {
+				return nil, fmt.Errorf("config: project %q uses removed field 'gitea_credential'; "+
+					"remove it and configure the global 'gitea' block instead", p.Name)
+			}
+		}
+	}
+
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file: %w", err)
@@ -72,16 +96,6 @@ func Load(path string) (*Config, error) {
 		cfg.LogFile = "sync.log"
 	}
 	return &cfg, nil
-}
-
-// FindGiteaCredential returns the GiteaCredential with the given name.
-func (c *Config) FindGiteaCredential(name string) (*GiteaCredential, error) {
-	for i := range c.GiteaCredentials {
-		if c.GiteaCredentials[i].Name == name {
-			return &c.GiteaCredentials[i], nil
-		}
-	}
-	return nil, fmt.Errorf("gitea credential %q not found", name)
 }
 
 // FindGithubCredential returns the GithubCredential with the given name.

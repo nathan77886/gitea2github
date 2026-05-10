@@ -11,8 +11,8 @@ A lightweight service that mirrors Gitea repositories to GitHub automatically vi
 
 ## Features
 
-- **Multi-account support** – configure any number of Gitea HTTP/SSH credentials and GitHub SSH credentials.
-- **Per-project mapping** – each project independently specifies which Gitea repo and GitHub repo to mirror, and which credentials to use.
+- **Single Gitea account, multiple GitHub accounts** – one global Gitea HTTP/HTTPS user is used for every project; any number of GitHub SSH credentials can be configured.
+- **Per-project mapping** – each project independently specifies which Gitea repo and GitHub repo to mirror, and which GitHub credential to use.
 - **Webhook signature validation** – HMAC-SHA256 (`X-Gitea-Signature`) verified globally or per-project.
 - **Async, deduplicated queue** – rapid consecutive pushes to the same repo are collapsed into a single sync operation.
 - **File locking** – ensures no two goroutines sync the same project concurrently.
@@ -54,6 +54,13 @@ docker run -d \
 | `work_dir` | `work` | Directory for local bare-clone mirrors |
 | `queue_dir` | `queue` | Directory for async queue files |
 | `log_file` | `sync.log` | Rolling sync log path |
+| `gitea.username` | – | Username for the global Gitea HTTP(S) account |
+| `gitea.password` | – | Password or personal access token for the global Gitea account |
+
+> **Note:** Gitea is supported over HTTP/HTTPS only. The `gitea_repo` URL on
+> each project must use `http://` or `https://`. A single global `gitea`
+> account is shared by every project; per-project `gitea_credential` is no
+> longer accepted and a config that still contains it will fail to load.
 
 See [`config.yaml.example`](config.yaml.example) for a fully annotated example.
 
